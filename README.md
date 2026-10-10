@@ -35,12 +35,13 @@ go get github.com/aijiesd520/dgodriver
 
 ## Quick start
 
+This example follows the same flow as the zendriver example: launch a browser, open the BrowserScan bot-detection page, save a screenshot, and stop the browser. The screenshot is written to the current working directory.
+
 ```go
 package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -48,35 +49,39 @@ import (
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	browser, err := dgodriver.Start(ctx, dgodriver.Config{Headless: true})
+	browser, err := dgodriver.Start(ctx)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer browser.Close()
 
-	tab, err := browser.Get(ctx, "https://example.com")
+	page, err := browser.Get(ctx, "https://www.browserscan.net/bot-detection")
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	if err := page.SaveScreenshot(ctx, "browserscan.png"); err != nil {
+		return err
 	}
 
-	var title string
-	if err := tab.Evaluate(ctx, "document.title", &title); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(title)
+	return browser.Stop(ctx)
 }
 ```
 
-Run the included examples from a checkout:
+The repository also includes runnable examples:
 
 ```sh
 go run ./examples/basic
 go run ./examples/network
 ```
-
 ## Capabilities
 
 - Launch or attach to Chromium-based browsers, use temporary or persistent profiles, and manage tabs, windows, browser contexts, permissions, and extensions.
