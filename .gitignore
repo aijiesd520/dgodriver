@@ -1,0 +1,46 @@
+# Go build, test, and profiling output
+/bin/
+/dist/
+*.exe
+*.test
+coverage.out
+*.cover
+*.prof
+*.pprof
+*.log
+.cache/
+
+# Local Go workspace files
+go.work
+go.work.sum
+
+# Browser-generated captures and downloads
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.pdf
+*.mhtml
+*.webm
+cookies*.json
+
+# Local browser profiles and temporary data
+.dgodriver-*/
+user-data/
+chrome-profile/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+__pycache__/

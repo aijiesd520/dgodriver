@@ -1,0 +1,17 @@
+dgodriver is a Go port based on the supplied nodriver and zendriver projects.
+
+Reference implementation: zendriver 0.17.1
+https://github.com/cdpdriver/zendriver
+
+Original project: nodriver
+https://github.com/ultrafunkamsterdam/nodriver
+
+The reference projects are licensed under the GNU Affero General Public
+License, version 3. The full license is included in LICENSE.
+
+Chrome DevTools Protocol declarations originate from Chromium's protocol
+specification and the generated PyCDP declarations shipped with zendriver.
+https://chromedevtools.github.io/devtools-protocol/
+
+Runtime dependency: github.com/gorilla/websocket, BSD-2-Clause.
+Its license remains in the dependency distribution.
