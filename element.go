@@ -22,9 +22,20 @@ type Element struct {
 	recording *VideoRecording
 }
 
-func (e *Element) Tab() *Tab         { return e.tab }
-func (e *Element) Node() cdp.DOMNode { e.mu.Lock(); defer e.mu.Unlock(); return e.node }
-func (e *Element) TagName() string   { return strings.ToLower(e.Node().NodeName) }
+// Tab returns the target containing this element.
+func (e *Element) Tab() *Tab { return e.tab }
+
+// Node returns the cached DOM metadata; Update refreshes it.
+func (e *Element) Node() cdp.DOMNode {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.node
+}
+
+// TagName returns the cached node name in lowercase.
+func (e *Element) TagName() string { return strings.ToLower(e.Node().NodeName) }
+
+// Attributes returns the cached HTML attributes as a new map.
 func (e *Element) Attributes() map[string]string {
 	attrs := e.Node().Attributes
 	result := map[string]string{}
@@ -33,7 +44,11 @@ func (e *Element) Attributes() map[string]string {
 	}
 	return result
 }
+
+// Get returns a cached attribute value, or an empty string if absent.
 func (e *Element) Get(name string) string { return e.Attributes()[name] }
+
+// Children returns the cached child nodes.
 func (e *Element) Children() []*Element {
 	var result []*Element
 	for _, n := range e.Node().Children {
@@ -41,6 +56,8 @@ func (e *Element) Children() []*Element {
 	}
 	return result
 }
+
+// ShadowRoots returns the cached shadow roots, including closed roots exposed by CDP.
 func (e *Element) ShadowRoots() []*Element {
 	var result []*Element
 	for _, n := range e.Node().ShadowRoots {
@@ -48,6 +65,8 @@ func (e *Element) ShadowRoots() []*Element {
 	}
 	return result
 }
+
+// ShadowChildren returns the cached children of this element's shadow roots.
 func (e *Element) ShadowChildren() []*Element {
 	var result []*Element
 	for _, root := range e.ShadowRoots() {
@@ -55,6 +74,8 @@ func (e *Element) ShadowChildren() []*Element {
 	}
 	return result
 }
+
+// ContentDocument returns a cached in-process frame document, or nil if absent.
 func (e *Element) ContentDocument() *Element {
 	n := e.Node().ContentDocument
 	if n == nil {
@@ -62,6 +83,8 @@ func (e *Element) ContentDocument() *Element {
 	}
 	return &Element{tab: e.tab, node: *n}
 }
+
+// Update refreshes the element's metadata using its backend node ID.
 func (e *Element) Update(ctx context.Context) error {
 	n := e.Node()
 	r, err := cdp.DOM.DescribeNode(cdp.DOMDescribeNodeParams{BackendNodeID: &n.BackendNodeID, Depth: cdp.Ptr(-1), Pierce: cdp.Ptr(true)}).Execute(ctx, e.tab)
@@ -72,11 +95,15 @@ func (e *Element) Update(ctx context.Context) error {
 	}
 	return err
 }
+
+// RemoteObject resolves this node into a JavaScript object; release it via CDP when done.
 func (e *Element) RemoteObject(ctx context.Context) (cdp.RuntimeRemoteObject, error) {
 	n := e.Node()
 	r, err := cdp.DOM.ResolveNode(cdp.DOMResolveNodeParams{BackendNodeID: &n.BackendNodeID}).Execute(ctx, e.tab)
 	return r.Object, err
 }
+
+// ObjectID returns a JavaScript object ID; release it via Runtime.releaseObject when done.
 func (e *Element) ObjectID(ctx context.Context) (cdp.RuntimeRemoteObjectID, error) {
 	object, err := e.RemoteObject(ctx)
 	if err != nil {
@@ -92,6 +119,9 @@ func releaseObject(t *Tab, id cdp.RuntimeRemoteObjectID) {
 	defer cancel()
 	_, _ = cdp.Runtime.ReleaseObject(cdp.RuntimeReleaseObjectParams{ObjectID: id}).Execute(ctx, t)
 }
+
+// Apply invokes a JavaScript function with the element as both this and its first
+// argument (for example, "el => el.textContent"). See EvaluateOptions for results.
 func (e *Element) Apply(ctx context.Context, jsFunction string, out any, options ...EvaluateOptions) error {
 	id, err := e.ObjectID(ctx)
 	if err != nil {
@@ -123,9 +153,13 @@ func (e *Element) related(ctx context.Context, expression string) (*Element, err
 	}
 	return &Element{tab: e.tab, node: r.Node}, nil
 }
+
+// Parent resolves the current parent node, or returns ErrNotFound when absent.
 func (e *Element) Parent(ctx context.Context) (*Element, error) {
 	return e.related(ctx, "el.parentNode")
 }
+
+// GetFrame resolves an out-of-process iframe target. For in-process frames use ContentDocument.
 func (e *Element) GetFrame(ctx context.Context) (*Tab, error) {
 	n := e.Node()
 	if n.FrameID == nil {
@@ -138,33 +172,50 @@ func (e *Element) GetFrame(ctx context.Context) (*Tab, error) {
 	}
 	return nil, fmt.Errorf("dgodriver: frame is in-process; use ContentDocument or QuerySelector")
 }
+
+// Click invokes the element's JavaScript click method; MouseClick sends mouse input.
 func (e *Element) Click(ctx context.Context) error { return e.Apply(ctx, "el=>el.click()", nil) }
+
+// Focus gives keyboard focus to the element.
 func (e *Element) Focus(ctx context.Context) error {
 	n := e.Node()
 	_, err := cdp.DOM.Focus(cdp.DOMFocusParams{BackendNodeID: &n.BackendNodeID}).Execute(ctx, e.tab)
 	return err
 }
+
+// ScrollIntoView scrolls the element into the viewport when needed.
 func (e *Element) ScrollIntoView(ctx context.Context) error {
 	n := e.Node()
 	_, err := cdp.DOM.ScrollIntoViewIfNeeded(cdp.DOMScrollIntoViewIfNeededParams{BackendNodeID: &n.BackendNodeID}).Execute(ctx, e.tab)
 	return err
 }
+
+// TextAll reads textContent, including descendant text.
 func (e *Element) TextAll(ctx context.Context) (string, error) {
 	var text string
 	err := e.Apply(ctx, "el=>el.textContent", &text)
 	return text, err
 }
+
+// Text reads only direct text-node children.
 func (e *Element) Text(ctx context.Context) (string, error) {
 	var text string
 	err := e.Apply(ctx, "el=>Array.from(el.childNodes).filter(n=>n.nodeType===3).map(n=>n.textContent).join('')", &text)
 	return text, err
 }
+
+// GetHTML returns the element's outer HTML.
 func (e *Element) GetHTML(ctx context.Context) (string, error) {
 	n := e.Node()
 	r, err := cdp.DOM.GetOuterHTML(cdp.DOMGetOuterHTMLParams{BackendNodeID: &n.BackendNodeID}).Execute(ctx, e.tab)
 	return r.OuterHTML, err
 }
-func jsString(s string) string { raw, _ := json.Marshal(s); return string(raw) }
+func jsString(s string) string {
+	raw, _ := json.Marshal(s)
+	return string(raw)
+}
+
+// SetText replaces textContent, removing existing child nodes.
 func (e *Element) SetText(ctx context.Context, value string) error {
 	return e.Apply(ctx, "el=>{el.textContent="+jsString(value)+"}", nil)
 }
@@ -173,7 +224,11 @@ func (e *Element) SetText(ctx context.Context, value string) error {
 func (e *Element) SetValue(ctx context.Context, value string) error {
 	return e.Apply(ctx, "el=>{let proto=el;let setter;while(proto&&!setter){setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;proto=Object.getPrototypeOf(proto)}const native=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value')?.set;const set=native||setter;if(!set)throw new Error('element has no value setter');set.call(el,"+jsString(value)+");el.dispatchEvent(new InputEvent('input',{bubbles:true,cancelable:true,inputType:'insertText',data:"+jsString(value)+"}));el.dispatchEvent(new Event('change',{bubbles:true}))}", nil)
 }
+
+// ClearInput clears the value using the native setter and dispatches input/change events.
 func (e *Element) ClearInput(ctx context.Context) error { return e.SetValue(ctx, "") }
+
+// ClearInputByDeleting selects all text and sends Backspace using keyboard input.
 func (e *Element) ClearInputByDeleting(ctx context.Context) error {
 	if err := e.Focus(ctx); err != nil {
 		return err
@@ -187,18 +242,24 @@ func (e *Element) ClearInputByDeleting(ctx context.Context) error {
 	}
 	return e.tab.PressKey(ctx, "Backspace")
 }
+
+// SendKeys focuses the element and types text using keyboard input.
 func (e *Element) SendKeys(ctx context.Context, text string) error {
 	if err := e.Focus(ctx); err != nil {
 		return err
 	}
 	return e.tab.TypeText(ctx, text)
 }
+
+// PressKey focuses the element and dispatches a key with optional modifiers.
 func (e *Element) PressKey(ctx context.Context, key string, modifiers ...KeyModifiers) error {
 	if err := e.Focus(ctx); err != nil {
 		return err
 	}
 	return e.tab.PressKey(ctx, key, modifiers...)
 }
+
+// SendFile selects local files for a file input using absolute paths.
 func (e *Element) SendFile(ctx context.Context, paths ...string) error {
 	files := make([]string, len(paths))
 	for i, p := range paths {

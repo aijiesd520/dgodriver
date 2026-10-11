@@ -98,9 +98,27 @@ See [API_PARITY.md](API_PARITY.md) for a detailed mapping from zendriver APIs to
 
 ## Browser configuration notes
 
+Browser selection uses `Config.BrowserExecutablePath` first, then the `DGODRIVER_BROWSER` environment variable, then automatic discovery (`Config.Browser`, default `auto`). The environment variable accepts an executable path or a name on `PATH`; an invalid override returns an error. Discovery checks `PATH`, standard Windows install directories, Linux `/opt`, `/usr/bin` and snap launchers, and both `/Applications` and `~/Applications` on macOS.
+
+Chromium cannot launch as root on Linux with its sandbox enabled. Prefer running as a non-root user. If your trusted container environment requires disabling the sandbox, explicitly use `Config{NoSandbox: true}`. The library reports this requirement before launch and does not disable the sandbox automatically. Docker itself does not imply that the sandbox must be disabled; other launch failures retain Chromium's stderr in the error.
+
+With `Config.Port == 0`, the library selects an available concrete debugging port before launching Chromium. Another process can claim it between selection and launch. Port reservation is not atomic; concurrent applications should coordinate explicit ports if collisions occur. Startup is bounded by `StartupTimeout` (15 seconds by default). The library does not use `--remote-debugging-port=0`, which Chromium treats as an automation signal.
+
+CDP commands without a context deadline time out after 60 seconds, including time spent waiting for another command to write. Pass a context with an explicit deadline to use a shorter or longer timeout. A response timeout releases the pending command without closing the connection.
+
+`Browser.Stop(ctx)` attempts a graceful shutdown, then terminates the owned browser's process tree if it does not exit or the context is cancelled. Windows uses `taskkill /T`; Unix uses an isolated process group. Attaching to an existing browser does not transfer ownership of its process.
+
+Only profiles and unpacked extension directories created by the library are removed during shutdown. A supplied `UserDataDir` is preserved. On Windows, deletion failures are retried for up to two seconds per temporary directory so browser file handles can be released; persistent cleanup failures are returned by `Stop`/`Close`.
+
 `Config{Headless: true}` launches Chromium in headless mode. In headless mode, dgodriver removes the `Headless` token from the User-Agent it reads from the browser unless you provide a custom User-Agent.
 
 `Config{Expert: true}` injects a script that makes newly created Shadow DOM roots open, so automation code can inspect them. These options are convenience and debugging features, not a comprehensive stealth or fingerprint-masking system. Websites may still identify automation or restrict access.
+
+## Event handlers and memory
+
+Each `Subscription` delivers callbacks serially and in event order, outside the WebSocket reader. Its pending event queue is unbounded: if events arrive faster than a callback finishes, memory usage can grow. Keep callbacks short, subscribe to specific event names when possible, and close subscriptions or cancel their contexts when finished. For expensive logging or processing, pass events to an application-owned bounded worker queue and choose its overflow policy explicitly. Blocking while writing to that queue still allows the subscription queue to grow.
+
+The library does not silently drop events: missing target lifecycle events can corrupt tab state, and missing `Fetch.requestPaused` events can leave requests paused. For interception, continuously consume `Interceptor.Next` and resolve every request with `Continue`, `Fail` or `Fulfill`; close the interceptor when finished.
 
 ## Responsible use and disclaimer
 

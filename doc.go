@@ -5,5 +5,8 @@
 // browser, event subscriptions, expectations and interceptors when finished.
 package dgodriver
 
+// Version is the library's current version.
 const Version = "0.1.0"
+
+// ZendriverVersion identifies the upstream version used for the CDP snapshot.
 const ZendriverVersion = "0.17.1"

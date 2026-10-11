@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +22,7 @@ import (
 	"github.com/aijiesd520/dgodriver/cdp"
 )
 
+// BrowserInfo describes the browser's /json/version discovery response.
 type BrowserInfo struct {
 	Browser              string `json:"Browser"`
 	ProtocolVersion      string `json:"Protocol-Version"`
@@ -27,6 +30,8 @@ type BrowserInfo struct {
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 }
 
+// Browser manages a CDP connection, targets and any locally launched process.
+// Use Close or Stop to release resources; canceling Start's context does not stop it.
 type Browser struct {
 	*Connection
 	Config        Config
@@ -34,6 +39,7 @@ type Browser struct {
 	mu            sync.Mutex
 	targets       map[string]*Tab
 	order         []string
+	targetQueries map[*targetQuery]struct{}
 	contexts      map[string]*BrowserContext
 	downloadMu    sync.Mutex
 	downloadPaths map[string]string
@@ -47,6 +53,11 @@ type Browser struct {
 	stopErr       error
 	stopped       chan struct{}
 }
+
+// targetQuery records only targets destroyed while a CDP target query is in flight.
+// Removing completed queries avoids retaining every closed target for the browser's lifetime.
+type targetQuery struct{ destroyed map[string]struct{} }
+
 type lockedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -57,7 +68,11 @@ func (b *lockedBuffer) Write(p []byte) (int, error) {
 	defer b.mu.Unlock()
 	return b.b.Write(p)
 }
-func (b *lockedBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.b.String() }
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
 
 // Start launches Chromium, or attaches when Config has Host+Port or WebSocketURL.
 // ctx bounds startup; browser lifetime is explicitly managed by Close/Stop.
@@ -82,7 +97,14 @@ func Start(ctx context.Context, configs ...Config) (_ *Browser, err error) {
 	}
 	startup, cancel := context.WithTimeout(ctx, cfg.StartupTimeout)
 	defer cancel()
-	b := &Browser{Config: cfg, targets: map[string]*Tab{}, contexts: map[string]*BrowserContext{}, downloadPaths: map[string]string{}, stopped: make(chan struct{}), client: &http.Client{Timeout: cfg.HTTPTimeout}}
+	b := &Browser{
+		Config:        cfg,
+		targets:       make(map[string]*Tab),
+		contexts:      make(map[string]*BrowserContext),
+		downloadPaths: make(map[string]string),
+		stopped:       make(chan struct{}),
+		client:        &http.Client{Timeout: cfg.HTTPTimeout},
+	}
 	defer func() {
 		if err != nil {
 			_ = b.Close()
@@ -90,6 +112,9 @@ func Start(ctx context.Context, configs ...Config) (_ *Browser, err error) {
 	}()
 	attach := cfg.WebSocketURL != "" || (cfg.Host != "" && cfg.Port > 0)
 	if !attach {
+		if runtime.GOOS == "linux" && os.Geteuid() == 0 && !cfg.NoSandbox {
+			return nil, fmt.Errorf("dgodriver: Chromium cannot run as root on Linux with the sandbox enabled; run as a non-root user or explicitly set Config.NoSandbox = true in a trusted environment")
+		}
 		if b.Config.Host == "" {
 			b.Config.Host = "127.0.0.1"
 		}
@@ -155,14 +180,6 @@ func Start(ctx context.Context, configs ...Config) (_ *Browser, err error) {
 			default:
 			}
 		}
-		if b.Config.Port == 0 && b.Config.UserDataDir != "" {
-			if data, e := os.ReadFile(filepath.Join(b.Config.UserDataDir, "DevToolsActivePort")); e == nil {
-				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-				if len(lines) > 0 {
-					b.Config.Port, _ = strconv.Atoi(strings.TrimSpace(lines[0]))
-				}
-			}
-		}
 		if b.Config.Port > 0 {
 			if e := b.HTTPGet(startup, "version", &b.Info); e == nil {
 				websocketURL = b.Info.WebSocketDebuggerURL
@@ -179,9 +196,8 @@ func Start(ctx context.Context, configs ...Config) (_ *Browser, err error) {
 	if err != nil {
 		return nil, err
 	}
-	b.Connection.AddHandler(context.Background(), "Target.targetCreated", b.handleTarget)
-	b.Connection.AddHandler(context.Background(), "Target.targetInfoChanged", b.handleTarget)
-	b.Connection.AddHandler(context.Background(), "Target.targetDestroyed", b.handleTarget)
+	// One subscription preserves wire order across creation, updates and destruction.
+	b.Connection.AddHandler(context.Background(), "Target.*", b.handleTarget)
 	if err = b.Send(startup, "Target.setDiscoverTargets", map[string]any{"discover": true}, nil); err != nil {
 		return nil, err
 	}
@@ -190,10 +206,16 @@ func Start(ctx context.Context, configs ...Config) (_ *Browser, err error) {
 	}
 	return b, nil
 }
+
+// Connect attaches to an existing browser without taking ownership of its process.
 func Connect(ctx context.Context, websocketURL string) (*Browser, error) {
 	return Start(ctx, Config{WebSocketURL: websocketURL})
 }
+
+// WebSocketURL returns the browser's CDP WebSocket endpoint.
 func (b *Browser) WebSocketURL() string { return b.Info.WebSocketDebuggerURL }
+
+// HTTPGet decodes a /json discovery response. It requires Config.Host and Port.
 func (b *Browser) HTTPGet(ctx context.Context, endpoint string, out any) error {
 	address := net.JoinHostPort(b.Config.Host, strconv.Itoa(b.Config.Port))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+address+"/json/"+strings.TrimPrefix(endpoint, "/"), nil)
@@ -212,38 +234,93 @@ func (b *Browser) HTTPGet(ctx context.Context, endpoint string, out any) error {
 	return json.NewDecoder(response.Body).Decode(out)
 }
 func (b *Browser) handleTarget(e Event) {
-	if e.Method == "Target.targetDestroyed" {
+	switch e.Method {
+	case "Target.targetDestroyed":
 		var p cdp.TargetTargetDestroyed
+		if e.Decode(&p) == nil && p.TargetID != "" {
+			b.removeTarget(string(p.TargetID))
+		}
+	case "Target.targetCreated":
+		var p cdp.TargetTargetCreated
+		if e.Decode(&p) == nil {
+			b.upsert(p.TargetInfo, nil)
+		}
+	case "Target.targetInfoChanged":
+		var p cdp.TargetTargetInfoChanged
 		if e.Decode(&p) != nil {
 			return
 		}
-		id := string(p.TargetID)
 		b.mu.Lock()
-		tab := b.targets[id]
-		delete(b.targets, id)
-		b.mu.Unlock()
-		if tab != nil {
+		if tab := b.targets[string(p.TargetInfo.TargetID)]; tab != nil {
 			tab.mu.Lock()
-			conn := tab.conn
-			tab.destroyed = true
+			tab.target = p.TargetInfo
 			tab.mu.Unlock()
-			if conn != nil {
-				conn.finish()
-			}
 		}
-		return
-	}
-	var p struct {
-		TargetInfo cdp.TargetTargetInfo `json:"targetInfo"`
-	}
-	if e.Decode(&p) == nil {
-		b.upsert(p.TargetInfo)
+		b.mu.Unlock()
 	}
 }
-func (b *Browser) upsert(info cdp.TargetTargetInfo) *Tab {
-	id := string(info.TargetID)
+
+func (b *Browser) removeTarget(id string) {
+	if id == "" {
+		return
+	}
+	b.mu.Lock()
+	for query := range b.targetQueries {
+		query.destroyed[id] = struct{}{}
+	}
+	tab := b.targets[id]
+	delete(b.targets, id)
+	for i, targetID := range b.order {
+		if targetID == id {
+			copy(b.order[i:], b.order[i+1:])
+			b.order[len(b.order)-1] = ""
+			b.order = b.order[:len(b.order)-1]
+			break
+		}
+	}
+	var conn *Connection
+	if tab != nil {
+		tab.mu.Lock()
+		tab.destroyed = true
+		conn = tab.conn
+		tab.mu.Unlock()
+	}
+	b.mu.Unlock()
+	if conn != nil {
+		conn.finish()
+		conn.transport.removeSession(conn.session)
+	}
+}
+
+func (b *Browser) beginTargetQuery() *targetQuery {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	query := &targetQuery{destroyed: make(map[string]struct{})}
+	if b.targetQueries == nil {
+		b.targetQueries = make(map[*targetQuery]struct{})
+	}
+	b.targetQueries[query] = struct{}{}
+	return query
+}
+
+func (b *Browser) endTargetQuery(query *targetQuery) {
+	b.mu.Lock()
+	delete(b.targetQueries, query)
+	b.mu.Unlock()
+}
+
+func (b *Browser) upsert(info cdp.TargetTargetInfo, query *targetQuery) *Tab {
+	id := string(info.TargetID)
+	if id == "" {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if query != nil {
+		if _, destroyed := query.destroyed[id]; destroyed {
+			return nil
+		}
+	}
 	if t := b.targets[id]; t != nil {
 		t.mu.Lock()
 		t.target = info
@@ -255,16 +332,22 @@ func (b *Browser) upsert(info cdp.TargetTargetInfo) *Tab {
 	b.order = append(b.order, id)
 	return t
 }
+
+// UpdateTargets refreshes known targets from the browser's current target list.
 func (b *Browser) UpdateTargets(ctx context.Context) error {
+	query := b.beginTargetQuery()
+	defer b.endTargetQuery(query)
 	result, err := cdp.Target.GetTargets(cdp.TargetGetTargetsParams{}).Execute(ctx, b)
 	if err != nil {
 		return err
 	}
 	for _, info := range result.TargetInfos {
-		b.upsert(info)
+		b.upsert(info, query)
 	}
 	return nil
 }
+
+// Targets returns a snapshot of all known targets in discovery order.
 func (b *Browser) Targets() []*Tab {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -278,6 +361,8 @@ func (b *Browser) Targets() []*Tab {
 	}
 	return list
 }
+
+// Tabs returns the known page targets, excluding workers and iframe targets.
 func (b *Browser) Tabs() []*Tab {
 	var list []*Tab
 	for _, t := range b.Targets() {
@@ -287,6 +372,8 @@ func (b *Browser) Tabs() []*Tab {
 	}
 	return list
 }
+
+// MainTab returns the first page target, or nil when no page is open.
 func (b *Browser) MainTab() *Tab {
 	tabs := b.Tabs()
 	if len(tabs) == 0 {
@@ -294,6 +381,8 @@ func (b *Browser) MainTab() *Tab {
 	}
 	return tabs[0]
 }
+
+// GetTab refreshes targets and finds a page by a case-insensitive title/URL substring.
 func (b *Browser) GetTab(ctx context.Context, text string) (*Tab, error) {
 	if err := b.UpdateTargets(ctx); err != nil {
 		return nil, err
@@ -307,6 +396,8 @@ func (b *Browser) GetTab(ctx context.Context, text string) (*Tab, error) {
 	}
 	return nil, ErrNotFound
 }
+
+// Tab returns the target with id, querying CDP if it is not already known.
 func (b *Browser) Tab(ctx context.Context, id string) (*Tab, error) {
 	b.mu.Lock()
 	t := b.targets[id]
@@ -314,15 +405,25 @@ func (b *Browser) Tab(ctx context.Context, id string) (*Tab, error) {
 	if t != nil {
 		return t, nil
 	}
+	query := b.beginTargetQuery()
+	defer b.endTargetQuery(query)
 	result, err := cdp.Target.GetTargetInfo(cdp.TargetGetTargetInfoParams{TargetID: cdp.Ptr(cdp.TargetTargetID(id))}).Execute(ctx, b)
 	if err != nil {
 		return nil, err
 	}
-	return b.upsert(result.TargetInfo), nil
+	if tab := b.upsert(result.TargetInfo, query); tab != nil {
+		return tab, nil
+	}
+	return nil, ErrClosed
 }
 
-type NavigationOptions struct{ NewTab, NewWindow bool }
+// NavigationOptions selects a new tab or window instead of reusing the main tab.
+type NavigationOptions struct {
+	NewTab    bool
+	NewWindow bool
+}
 
+// Get navigates the main tab, creating a tab if needed or requested by options.
 func (b *Browser) Get(ctx context.Context, url string, options ...NavigationOptions) (*Tab, error) {
 	if url == "" {
 		url = "about:blank"
@@ -340,6 +441,9 @@ func (b *Browser) Get(ctx context.Context, url string, options ...NavigationOpti
 	}
 	return t, nil
 }
+
+// NewTab opens url and waits for an interactive document. Empty url opens about:blank.
+// Set newWindow to true to open a separate window.
 func (b *Browser) NewTab(ctx context.Context, url string, newWindow ...bool) (*Tab, error) {
 	p := cdp.TargetCreateTargetParams{URL: url}
 	if p.URL == "" {
@@ -361,6 +465,8 @@ func (b *Browser) NewTab(ctx context.Context, url string, newWindow ...bool) (*T
 	}
 	return t, nil
 }
+
+// Stopped reports whether shutdown, connection loss or process exit has occurred.
 func (b *Browser) Stopped() bool {
 	select {
 	case <-b.stopped:
@@ -379,11 +485,18 @@ func (b *Browser) Stopped() bool {
 	}
 	return false
 }
+
+// Close calls Stop with an independent eight-second context.
 func (b *Browser) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	return b.Stop(ctx)
 }
+
+// Stop disposes managed contexts and closes CDP. For a launched browser it also
+// requests graceful exit, then forces process-tree termination if needed.
+// Cleanup still runs with a canceled context; only library-owned directories are
+// removed. Repeated calls return the first shutdown's result.
 func (b *Browser) Stop(ctx context.Context) error {
 	b.stopOnce.Do(func() {
 		defer close(b.stopped)
@@ -393,7 +506,9 @@ func (b *Browser) Stop(ctx context.Context) error {
 			}
 		}
 		if b.process != nil && b.Connection != nil {
-			_ = b.Send(ctx, "Browser.close", nil, nil)
+			closeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_ = b.Send(closeCtx, "Browser.close", nil, nil)
+			cancel()
 		}
 		if b.Connection != nil {
 			_ = b.Connection.Close()
@@ -402,31 +517,45 @@ func (b *Browser) Stop(ctx context.Context) error {
 			select {
 			case <-b.processDone:
 			case <-ctx.Done():
-				_ = b.process.Process.Kill()
+				b.stopErr = errors.Join(b.stopErr, killProcessTree(b.process))
 			case <-time.After(3 * time.Second):
-				_ = b.process.Process.Kill()
+				b.stopErr = errors.Join(b.stopErr, killProcessTree(b.process))
 			}
 			select {
 			case <-b.processDone:
 			case <-time.After(3 * time.Second):
-				b.stopErr = fmt.Errorf("dgodriver: browser did not exit")
-				return
+				b.stopErr = errors.Join(b.stopErr, fmt.Errorf("dgodriver: browser did not exit"))
 			}
 		}
 		if b.ownedProfile {
-			if err := os.RemoveAll(b.Config.UserDataDir); err != nil && b.stopErr == nil {
-				b.stopErr = err
-			}
+			b.stopErr = errors.Join(b.stopErr, removePathWithRetry(b.Config.UserDataDir))
 		}
 		for _, p := range b.extensionDirs {
-			if err := os.RemoveAll(p); err != nil && b.stopErr == nil {
-				b.stopErr = err
-			}
+			b.stopErr = errors.Join(b.stopErr, removePathWithRetry(p))
 		}
 		b.client.CloseIdleConnections()
 	})
 	return b.stopErr
 }
+
+// Windows may retain file handles briefly after the browser has exited.
+// Cleanup uses its own bounded retry window even if Stop's context is cancelled.
+func removePathWithRetry(path string) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := os.RemoveAll(path)
+		if err == nil {
+			return nil
+		}
+		if runtime.GOOS != "windows" || time.Now().After(deadline) {
+			return fmt.Errorf("dgodriver: remove temporary directory %q: %w", path, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// GrantPermissions overrides permissions for an origin and browser context.
+// Empty origin applies to all origins; empty contextID selects the default context.
 func (b *Browser) GrantPermissions(ctx context.Context, permissions []cdp.BrowserPermissionType, origin string, contextID string) error {
 	p := cdp.BrowserGrantPermissionsParams{Permissions: permissions}
 	if origin != "" {
@@ -438,6 +567,8 @@ func (b *Browser) GrantPermissions(ctx context.Context, permissions []cdp.Browse
 	_, err := cdp.Browser.GrantPermissions(p).Execute(ctx, b)
 	return err
 }
+
+// GrantAllPermissions grants the library's permission list to the default context.
 func (b *Browser) GrantAllPermissions(ctx context.Context) error {
 	names := []string{"audioCapture", "backgroundSync", "backgroundFetch", "clipboardReadWrite", "clipboardSanitizedWrite", "displayCapture", "durableStorage", "geolocation", "idleDetection", "localFonts", "midi", "midiSysex", "nfc", "notifications", "paymentHandler", "periodicBackgroundSync", "protectedMediaIdentifier", "sensors", "storageAccess", "topLevelStorageAccess", "videoCapture", "videoCapturePanTiltZoom", "wakeLockScreen", "wakeLockSystem", "windowManagement"}
 	permissions := make([]cdp.BrowserPermissionType, len(names))

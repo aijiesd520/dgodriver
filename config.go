@@ -16,25 +16,31 @@ import (
 // Config's zero value launches a visible Chromium browser with a temporary profile.
 // Host and Port together attach to an existing browser; WebSocketURL attaches directly.
 type Config struct {
+	// BrowserExecutablePath takes precedence over DGODRIVER_BROWSER and discovery.
 	BrowserExecutablePath string
 	Browser               string // auto, chrome, brave, msedge, chromium
-	UserDataDir           string
-	Headless              bool
-	NoSandbox             bool
-	Expert                bool
-	EnableWebRTC          bool
-	DisableWebGL          bool
-	UserAgent             string
-	Lang                  string
-	BrowserArgs           []string
-	Extensions            []string
-	Host                  string
-	Port                  int
-	WebSocketURL          string
-	StartupTimeout        time.Duration
-	HTTPTimeout           time.Duration
+	// UserDataDir is persistent when supplied; temporary profiles are removed on Stop.
+	UserDataDir string
+	Headless    bool
+	// NoSandbox disables Chromium's sandbox. Linux root launches require it.
+	NoSandbox    bool
+	Expert       bool
+	EnableWebRTC bool
+	DisableWebGL bool
+	UserAgent    string
+	Lang         string
+	BrowserArgs  []string
+	Extensions   []string
+	Host         string
+	// Port selects a debugging port; zero chooses an available concrete port.
+	Port         int
+	WebSocketURL string
+	// StartupTimeout defaults to 15 seconds; HTTPTimeout defaults to 10 seconds.
+	StartupTimeout time.Duration
+	HTTPTimeout    time.Duration
 }
 
+// AddArgument appends a browser flag, rejecting flags managed by Config fields.
 func (c *Config) AddArgument(arg string) error {
 	for _, prefix := range []string{"--headless", "--user-data-dir", "--no-sandbox", "--lang=", "--remote-debugging-"} {
 		if strings.HasPrefix(arg, prefix) {
@@ -44,6 +50,8 @@ func (c *Config) AddArgument(arg string) error {
 	c.BrowserArgs = append(c.BrowserArgs, arg)
 	return nil
 }
+
+// AddExtension registers an unpacked extension directory or a ZIP/CRX archive.
 func (c *Config) AddExtension(path string) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -55,6 +63,8 @@ func (c *Config) AddExtension(path string) error {
 	c.Extensions = append(c.Extensions, abs)
 	return nil
 }
+
+// MergeDisableFeaturesArgs combines --disable-features flags without duplicates.
 func MergeDisableFeaturesArgs(args []string) []string {
 	var result, features []string
 	seen := map[string]bool{}
@@ -75,8 +85,24 @@ func MergeDisableFeaturesArgs(args []string) []string {
 	}
 	return result
 }
+
+// Arguments returns Chromium launch flags for the configuration.
+// Start resolves the executable, profile directory and debugging port first.
 func (c Config) Arguments() []string {
-	args := []string{"--no-first-run", "--no-default-browser-check", "--no-service-autorun", "--homepage=about:blank", "--no-pings", "--password-store=basic", "--disable-infobars", "--disable-breakpad", "--disable-dev-shm-usage", "--disable-session-crashed-bubble", "--disable-search-engine-choice-screen", "--disable-features=IsolateOrigins,DisableLoadExtensionCommandLineSwitch,site-per-process"}
+	args := []string{
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--no-service-autorun",
+		"--homepage=about:blank",
+		"--no-pings",
+		"--password-store=basic",
+		"--disable-infobars",
+		"--disable-breakpad",
+		"--disable-dev-shm-usage",
+		"--disable-session-crashed-bubble",
+		"--disable-search-engine-choice-screen",
+		"--disable-features=IsolateOrigins,DisableLoadExtensionCommandLineSwitch,site-per-process",
+	}
 	if c.UserDataDir != "" {
 		args = append(args, "--user-data-dir="+c.UserDataDir)
 	}
@@ -108,16 +134,37 @@ func (c Config) Arguments() []string {
 	args = append(args, c.BrowserArgs...)
 	return MergeDisableFeaturesArgs(args)
 }
+
+// FindExecutable uses DGODRIVER_BROWSER when set, otherwise searches PATH and
+// standard installation directories for browser (auto, chrome, chromium,
+// msedge or brave). The environment variable accepts an executable path or name;
+// an invalid override returns an error instead of falling back to another browser.
 func FindExecutable(browser string) (string, error) {
+	if override := os.Getenv("DGODRIVER_BROWSER"); override != "" {
+		path, err := exec.LookPath(override)
+		if err != nil {
+			return "", fmt.Errorf("dgodriver: DGODRIVER_BROWSER %q: %w", override, err)
+		}
+		return path, nil
+	}
+	return findExecutable(browser)
+}
+
+func findExecutable(browser string) (string, error) {
 	if browser == "" || browser == "auto" {
 		for _, name := range []string{"chrome", "chromium", "msedge", "brave"} {
-			if path, err := FindExecutable(name); err == nil {
+			if path, err := findExecutable(name); err == nil {
 				return path, nil
 			}
 		}
-		return "", fmt.Errorf("dgodriver: no Chromium browser found; set BrowserExecutablePath")
+		return "", fmt.Errorf("dgodriver: no Chromium browser found; set BrowserExecutablePath or DGODRIVER_BROWSER")
 	}
-	names := map[string][]string{"chrome": {"google-chrome", "google-chrome-stable", "chrome"}, "chromium": {"chromium", "chromium-browser"}, "msedge": {"microsoft-edge", "microsoft-edge-stable", "msedge"}, "brave": {"brave-browser", "brave"}}
+	names := map[string][]string{
+		"chrome":   {"google-chrome", "google-chrome-stable", "chrome"},
+		"chromium": {"chromium", "chromium-browser"},
+		"msedge":   {"microsoft-edge", "microsoft-edge-stable", "msedge"},
+		"brave":    {"brave-browser", "brave"},
+	}
 	list, ok := names[browser]
 	if !ok {
 		return "", fmt.Errorf("dgodriver: unknown browser %q", browser)
@@ -137,11 +184,22 @@ func FindExecutable(browser string) (string, error) {
 		}
 	} else if runtime.GOOS == "darwin" {
 		app := map[string]string{"chrome": "Google Chrome", "chromium": "Chromium", "msedge": "Microsoft Edge", "brave": "Brave Browser"}[browser]
-		candidates = append(candidates, "/Applications/"+app+".app/Contents/MacOS/"+app)
+		relative := filepath.Join(app+".app", "Contents", "MacOS", app)
+		candidates = append(candidates, filepath.Join("/Applications", relative))
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			candidates = append(candidates, filepath.Join(homeDir, "Applications", relative))
+		}
+	} else if runtime.GOOS == "linux" {
+		candidates = map[string][]string{
+			"chrome":   {"/opt/google/chrome/chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"},
+			"chromium": {"/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium", "/var/lib/snapd/snap/bin/chromium"},
+			"msedge":   {"/opt/microsoft/msedge/msedge", "/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"},
+			"brave":    {"/opt/brave.com/brave/brave", "/usr/bin/brave-browser", "/snap/bin/brave", "/var/lib/snapd/snap/bin/brave"},
+		}[browser]
 	}
 	for _, p := range candidates {
-		if s, err := os.Stat(p); err == nil && !s.IsDir() {
-			return p, nil
+		if path, err := exec.LookPath(p); err == nil {
+			return path, nil
 		}
 	}
 	return "", fmt.Errorf("dgodriver: %s executable not found", browser)
@@ -168,7 +226,7 @@ func unpackExtension(path string) (string, error) {
 	ok := false
 	defer func() {
 		if !ok {
-			os.RemoveAll(dir)
+			_ = removePathWithRetry(dir)
 		}
 	}()
 	for _, f := range z.File {

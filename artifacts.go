@@ -13,6 +13,8 @@ import (
 	"github.com/aijiesd520/dgodriver/cdp"
 )
 
+// ScreenshotOptions configures PNG (default), JPEG or WebP capture.
+// Scale defaults to one and applies to element or full-page clips.
 type ScreenshotOptions struct {
 	Format   string
 	FullPage bool
@@ -42,6 +44,8 @@ func screenshotParams(options []ScreenshotOptions) (cdp.PageCaptureScreenshotPar
 	}
 	return cdp.PageCaptureScreenshotParams{Format: &opt.Format, Quality: opt.Quality, FromSurface: cdp.Ptr(true), CaptureBeyondViewport: cdp.Ptr(opt.FullPage)}, opt, nil
 }
+
+// ScreenshotBase64 captures the page as a base64-encoded image.
 func (t *Tab) ScreenshotBase64(ctx context.Context, options ...ScreenshotOptions) (string, error) {
 	p, opt, err := screenshotParams(options)
 	if err != nil {
@@ -57,6 +61,8 @@ func (t *Tab) ScreenshotBase64(ctx context.Context, options ...ScreenshotOptions
 	r, err := cdp.Page.CaptureScreenshot(p).Execute(ctx, t)
 	return r.Data, err
 }
+
+// Screenshot captures the page as encoded image bytes.
 func (t *Tab) Screenshot(ctx context.Context, options ...ScreenshotOptions) ([]byte, error) {
 	s, err := t.ScreenshotBase64(ctx, options...)
 	if err != nil {
@@ -64,6 +70,8 @@ func (t *Tab) Screenshot(ctx context.Context, options ...ScreenshotOptions) ([]b
 	}
 	return base64.StdEncoding.DecodeString(s)
 }
+
+// SaveScreenshot writes a page image atomically. Empty path or "auto" generates a filename.
 func (t *Tab) SaveScreenshot(ctx context.Context, path string, options ...ScreenshotOptions) error {
 	data, err := t.Screenshot(ctx, options...)
 	if err != nil {
@@ -75,6 +83,8 @@ func (t *Tab) SaveScreenshot(ctx context.Context, path string, options ...Screen
 	}
 	return writeAtomic(path, data, 0644)
 }
+
+// ScreenshotBase64 scrolls the element into view and captures its bounding box.
 func (e *Element) ScreenshotBase64(ctx context.Context, options ...ScreenshotOptions) (string, error) {
 	if err := e.ScrollIntoView(ctx); err != nil {
 		return "", err
@@ -96,6 +106,8 @@ func (e *Element) ScreenshotBase64(ctx context.Context, options ...ScreenshotOpt
 	r, err := cdp.Page.CaptureScreenshot(p).Execute(ctx, e.tab)
 	return r.Data, err
 }
+
+// Screenshot captures the element as encoded image bytes.
 func (e *Element) Screenshot(ctx context.Context, options ...ScreenshotOptions) ([]byte, error) {
 	s, err := e.ScreenshotBase64(ctx, options...)
 	if err != nil {
@@ -103,6 +115,8 @@ func (e *Element) Screenshot(ctx context.Context, options ...ScreenshotOptions) 
 	}
 	return base64.StdEncoding.DecodeString(s)
 }
+
+// SaveScreenshot writes an element image atomically; empty path or "auto" generates a name.
 func (e *Element) SaveScreenshot(ctx context.Context, path string, options ...ScreenshotOptions) error {
 	data, err := e.Screenshot(ctx, options...)
 	if err != nil {
@@ -114,6 +128,8 @@ func (e *Element) SaveScreenshot(ctx context.Context, path string, options ...Sc
 	}
 	return writeAtomic(path, data, 0644)
 }
+
+// SaveSnapshot writes an MHTML snapshot, defaulting to snapshot.mhtml for empty path.
 func (t *Tab) SaveSnapshot(ctx context.Context, path string) error {
 	r, err := cdp.Page.CaptureSnapshot(cdp.PageCaptureSnapshotParams{Format: cdp.Ptr("mhtml")}).Execute(ctx, t)
 	if err != nil {
@@ -124,6 +140,8 @@ func (t *Tab) SaveSnapshot(ctx context.Context, path string) error {
 	}
 	return writeAtomic(path, []byte(r.Data), 0644)
 }
+
+// PrintToPDF renders the page to a PDF file using Chromium's print settings.
 func (t *Tab) PrintToPDF(ctx context.Context, path string, options ...cdp.PagePrintToPDFParams) error {
 	p := cdp.PagePrintToPDFParams{PrintBackground: cdp.Ptr(true)}
 	if len(options) > 0 {
@@ -338,7 +356,7 @@ func (t *Tab) DownloadFile(ctx context.Context, address, path string) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = removePathWithRetry(dir) }()
 	t.browser.mu.Lock()
 	previous := t.browser.downloadPaths[t.contextID()]
 	t.browser.mu.Unlock()
@@ -424,7 +442,13 @@ func (e *Element) RecordVideo(ctx context.Context, path string) (*VideoRecording
 	e.recording = recording
 	return recording, nil
 }
-func (e *Element) IsRecording() bool { e.mu.Lock(); defer e.mu.Unlock(); return e.recording != nil }
+
+// IsRecording reports whether the element has an active video recording handle.
+func (e *Element) IsRecording() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.recording != nil
+}
 func (v *VideoRecording) Stop(ctx context.Context) error {
 	v.once.Do(func() {
 		var encoded string

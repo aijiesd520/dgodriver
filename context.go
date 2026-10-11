@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"sync"
+	"time"
 
 	"github.com/aijiesd520/dgodriver/cdp"
 )
 
+// ContextOptions configures an isolated browser context and its optional proxy.
 type ContextOptions struct {
 	ProxyServer                       string
 	ProxyBypassList                   string
@@ -15,6 +17,8 @@ type ContextOptions struct {
 	OriginsWithUniversalNetworkAccess []string
 	KeepOnDetach                      bool
 }
+
+// BrowserContext isolates tabs, cookies and storage. Dispose or Close it when done.
 type BrowserContext struct {
 	ID       string
 	Browser  *Browser
@@ -23,6 +27,7 @@ type BrowserContext struct {
 	disposed bool
 }
 
+// CreateContext creates an isolated context, optionally with an authenticated proxy.
 func (b *Browser) CreateContext(ctx context.Context, options ...ContextOptions) (*BrowserContext, error) {
 	var opt ContextOptions
 	if len(options) > 0 {
@@ -59,6 +64,8 @@ func (b *Browser) CreateContext(ctx context.Context, options ...ContextOptions) 
 	b.mu.Unlock()
 	return bc, nil
 }
+
+// Contexts returns the contexts managed by this Browser, excluding the default context.
 func (b *Browser) Contexts() []*BrowserContext {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -68,6 +75,8 @@ func (b *Browser) Contexts() []*BrowserContext {
 	}
 	return list
 }
+
+// NewTab opens a page in this context and waits for an interactive document.
 func (bc *BrowserContext) NewTab(ctx context.Context, url string, newWindow ...bool) (*Tab, error) {
 	p := cdp.TargetCreateTargetParams{URL: url, BrowserContextID: cdp.Ptr(cdp.BrowserBrowserContextID(bc.ID))}
 	if p.URL == "" {
@@ -89,14 +98,20 @@ func (bc *BrowserContext) NewTab(ctx context.Context, url string, newWindow ...b
 	}
 	return t, nil
 }
+
+// Cookies returns a cookie manager scoped to this context.
 func (bc *BrowserContext) Cookies() *CookieJar {
 	return &CookieJar{browser: bc.Browser, contextID: bc.ID}
 }
+
+// Close disposes this context with an independent five-second context.
 func (bc *BrowserContext) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5e9)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return bc.Dispose(ctx)
 }
+
+// Dispose closes the context's tabs and proxy. Repeated successful calls are safe.
 func (bc *BrowserContext) Dispose(ctx context.Context) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()

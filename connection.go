@@ -15,9 +15,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ErrClosed indicates that a connection, target or subscription has closed.
 var ErrClosed = errors.New("dgodriver: connection closed")
+
+// ErrNotFound indicates that an immediate element or page query found no match.
 var ErrNotFound = errors.New("dgodriver: element not found")
 
+// ProtocolError is a CDP command error, including the command's method name.
 type ProtocolError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
@@ -29,12 +33,14 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("dgodriver: %s: %s (CDP %d)", e.Method, e.Message, e.Code)
 }
 
+// Event contains an unmodified CDP event payload and its optional target session.
 type Event struct {
 	Method    string          `json:"method"`
 	Params    json.RawMessage `json:"params"`
 	SessionID string          `json:"sessionId,omitempty"`
 }
 
+// Decode unmarshals the event parameters into out.
 func (e Event) Decode(out any) error { return json.Unmarshal(e.Params, out) }
 
 type wireMessage struct {
@@ -51,15 +57,15 @@ type pendingCall struct {
 }
 
 type transport struct {
-	ws       *websocket.Conn
-	writeMu  sync.Mutex
-	mu       sync.Mutex
-	next     atomic.Int64
-	pending  map[int64]pendingCall
-	sessions map[string]*Connection
-	done     chan struct{}
-	once     sync.Once
-	err      error
+	ws        *websocket.Conn
+	writeLock chan struct{}
+	mu        sync.Mutex
+	next      atomic.Int64
+	pending   map[int64]pendingCall
+	sessions  map[string]*Connection
+	done      chan struct{}
+	once      sync.Once
+	err       error
 }
 
 // Connection is a browser connection or a flattened CDP target session.
@@ -76,6 +82,8 @@ type Connection struct {
 	lastEvent atomic.Int64
 }
 
+// Dial opens a browser-level CDP connection. ctx bounds only the connection setup.
+// Close the returned connection when finished.
 func Dial(ctx context.Context, websocketURL string) (*Connection, error) {
 	ws, response, err := websocket.DefaultDialer.DialContext(ctx, websocketURL, nil)
 	if response != nil && response.Body != nil {
@@ -84,7 +92,13 @@ func Dial(ctx context.Context, websocketURL string) (*Connection, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dgodriver: connect: %w", err)
 	}
-	t := &transport{ws: ws, pending: make(map[int64]pendingCall), sessions: make(map[string]*Connection), done: make(chan struct{})}
+	t := &transport{
+		ws:        ws,
+		writeLock: make(chan struct{}, 1),
+		pending:   make(map[int64]pendingCall),
+		sessions:  make(map[string]*Connection),
+		done:      make(chan struct{}),
+	}
 	c := t.session("")
 	go t.readLoop()
 	return c, nil
@@ -100,8 +114,27 @@ func (t *transport) session(id string) *Connection {
 	t.sessions[id] = c
 	return c
 }
-func (c *Connection) SessionID() string     { return c.session }
+
+func (t *transport) removeSession(id string) {
+	if id == "" {
+		return
+	}
+	t.mu.Lock()
+	delete(t.sessions, id)
+	t.mu.Unlock()
+}
+
+// DefaultSendTimeout bounds commands without a context deadline. Supply a context
+// with a deadline to allow a longer command or enforce a shorter timeout.
+const DefaultSendTimeout = 60 * time.Second
+
+// SessionID returns the flattened target session ID; the browser session is empty.
+func (c *Connection) SessionID() string { return c.session }
+
+// Done is closed when this connection or target session terminates.
 func (c *Connection) Done() <-chan struct{} { return c.done }
+
+// Closed reports whether the connection or session has terminated.
 func (c *Connection) Closed() bool {
 	select {
 	case <-c.done:
@@ -111,7 +144,15 @@ func (c *Connection) Closed() bool {
 	}
 }
 
+// Send executes a CDP command, decoding its result into out when non-nil.
+// Commands without a context deadline use DefaultSendTimeout. Concurrent calls
+// are safe; a response timeout does not close the connection.
 func (c *Connection) Send(ctx context.Context, method string, params, out any) error {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultSendTimeout)
+		defer cancel()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -140,8 +181,28 @@ func (c *Connection) Send(ctx context.Context, method string, params, out any) e
 	}
 	t.pending[id] = pendingCall{c.session, response}
 	t.mu.Unlock()
-	defer func() { t.mu.Lock(); delete(t.pending, id); t.mu.Unlock() }()
-	t.writeMu.Lock()
+	defer func() {
+		t.mu.Lock()
+		delete(t.pending, id)
+		t.mu.Unlock()
+	}()
+	select {
+	case t.writeLock <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return ErrClosed
+	case <-t.done:
+		return ErrClosed
+	}
+	if err = ctx.Err(); err != nil {
+		<-t.writeLock
+		return err
+	}
+	if c.Closed() {
+		<-t.writeLock
+		return ErrClosed
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
@@ -150,7 +211,7 @@ func (c *Connection) Send(ctx context.Context, method string, params, out any) e
 	if err == nil {
 		err = t.ws.WriteMessage(websocket.TextMessage, raw)
 	}
-	t.writeMu.Unlock()
+	<-t.writeLock
 	if err != nil {
 		t.shutdown(err)
 		return fmt.Errorf("dgodriver: send %s: %w", method, err)
@@ -186,6 +247,8 @@ func (c *Connection) Send(ctx context.Context, method string, params, out any) e
 		return nil
 	}
 }
+
+// Call executes a CDP command and returns its raw JSON result.
 func (c *Connection) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	var result json.RawMessage
 	err := c.Send(ctx, method, params, &result)
@@ -273,6 +336,9 @@ func (c *Connection) finish() {
 		c.mu.Unlock()
 	})
 }
+
+// Close closes a browser connection or detaches a target session.
+// It does not terminate a browser process; use Browser.Close for launched browsers.
 func (c *Connection) Close() error {
 	if c.session == "" {
 		c.transport.shutdown(ErrClosed)
@@ -292,7 +358,11 @@ func (c *Connection) Close() error {
 	return err
 }
 
-// Subscription preserves event order per handler. Close is safe from its callback.
+// Subscription delivers events serially in order to a single handler, outside
+// the WebSocket reader. Its queue is unbounded: slow callbacks can grow memory
+// usage. Keep handlers short and use a bounded worker queue for expensive work.
+// Close or cancel the subscription context when finished. Close is safe from
+// the callback and discards pending events without waiting for a running callback.
 type Subscription struct {
 	conn     *Connection
 	method   string
@@ -320,8 +390,15 @@ func (s *Subscription) enqueue(e Event) {
 	}
 }
 func (s *Subscription) stop() {
-	s.once.Do(func() { close(s.done); s.mu.Lock(); s.queue = nil; s.mu.Unlock() })
+	s.once.Do(func() {
+		close(s.done)
+		s.mu.Lock()
+		s.queue = nil
+		s.mu.Unlock()
+	})
 }
+
+// Close unregisters the handler and releases pending events.
 func (s *Subscription) Close() error {
 	s.conn.mu.Lock()
 	delete(s.conn.handlers, s)
@@ -361,7 +438,9 @@ func (s *Subscription) loop(ctx context.Context) {
 	}
 }
 
-// AddHandler registers without enabling a domain. Use On for automatic enable.
+// AddHandler registers without enabling a domain. method accepts an exact event
+// name, "Domain.*" or "*". Use On for automatic enable. See Subscription for
+// callback ordering, queue growth and cleanup requirements.
 func (c *Connection) AddHandler(ctx context.Context, method string, fn func(Event)) *Subscription {
 	s := &Subscription{conn: c, method: method, callback: fn, wake: make(chan struct{}, 1), done: make(chan struct{})}
 	c.mu.Lock()
@@ -374,6 +453,8 @@ func (c *Connection) AddHandler(ctx context.Context, method string, fn func(Even
 	go s.loop(ctx)
 	return s
 }
+
+// Enable enables a CDP domain once; CSS and Overlay also enable DOM.
 func (c *Connection) Enable(ctx context.Context, domain string) error {
 	if domain == "CSS" || domain == "Overlay" {
 		if err := c.Enable(ctx, "DOM"); err != nil {
@@ -393,11 +474,16 @@ func (c *Connection) Enable(ctx context.Context, domain string) error {
 	}
 	return nil
 }
+
+// Disable disables a CDP domain and clears its enabled state on success.
 func (c *Connection) Disable(ctx context.Context, domain string) error {
 	c.enableMu.Lock()
 	defer c.enableMu.Unlock()
 	return c.Send(ctx, domain+".disable", nil, nil)
 }
+
+// On registers a handler and enables supported event domains automatically.
+// See AddHandler for patterns and Subscription for queue and lifetime semantics.
 func (c *Connection) On(ctx context.Context, method string, fn func(Event)) (*Subscription, error) {
 	s := c.AddHandler(ctx, method, fn)
 	domain := strings.SplitN(method, ".", 2)[0]
@@ -410,6 +496,8 @@ func (c *Connection) On(ctx context.Context, method string, fn func(Event)) (*Su
 	}
 	return s, nil
 }
+
+// RemoveHandlers closes handlers registered with method; empty method removes all.
 func (c *Connection) RemoveHandlers(method string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -435,6 +523,8 @@ func OnEvent[T cdp.Event](ctx context.Context, c *Connection, fn func(T)) (*Subs
 		}
 	})
 }
+
+// Sleep waits for duration or returns early when ctx is canceled.
 func Sleep(ctx context.Context, duration time.Duration) error {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
@@ -445,6 +535,9 @@ func Sleep(ctx context.Context, duration time.Duration) error {
 		return nil
 	}
 }
+
+// Wait waits until no CDP events have arrived for idle (default 250 milliseconds).
+// This measures CDP event activity, not network or document readiness.
 func (c *Connection) Wait(ctx context.Context, idle time.Duration) error {
 	if idle <= 0 {
 		idle = 250 * time.Millisecond

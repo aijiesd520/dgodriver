@@ -15,6 +15,8 @@ import (
 	"github.com/aijiesd520/dgodriver/cdp"
 )
 
+// Tab represents a CDP target, including pages, out-of-process frames and workers.
+// Its connection is attached lazily. Closed targets cannot be reused.
 type Tab struct {
 	browser        *Browser
 	mu             sync.Mutex
@@ -29,11 +31,26 @@ type Tab struct {
 	interceptor    *Interceptor
 }
 
-func (t *Tab) Browser() *Browser            { return t.browser }
-func (t *Tab) Target() cdp.TargetTargetInfo { t.mu.Lock(); defer t.mu.Unlock(); return t.target }
-func (t *Tab) TargetID() string             { return string(t.Target().TargetID) }
-func (t *Tab) URL() string                  { return t.Target().URL }
-func (t *Tab) Title() string                { return t.Target().Title }
+// Browser returns the browser managing this target.
+func (t *Tab) Browser() *Browser { return t.browser }
+
+// Target returns the last known target metadata; UpdateTarget refreshes it.
+func (t *Tab) Target() cdp.TargetTargetInfo {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.target
+}
+
+// TargetID returns the target's CDP identifier.
+func (t *Tab) TargetID() string { return string(t.Target().TargetID) }
+
+// URL returns the last known target URL.
+func (t *Tab) URL() string { return t.Target().URL }
+
+// Title returns the last known target title.
+func (t *Tab) Title() string { return t.Target().Title }
+
+// Connection attaches to the target when needed and returns its CDP session.
 func (t *Tab) Connection(ctx context.Context) (*Connection, error) {
 	t.attachMu.Lock()
 	defer t.attachMu.Unlock()
@@ -53,6 +70,12 @@ func (t *Tab) Connection(ctx context.Context) (*Connection, error) {
 	}
 	conn = t.browser.transport.session(string(result.SessionID))
 	t.mu.Lock()
+	if t.destroyed {
+		t.mu.Unlock()
+		conn.finish()
+		conn.transport.removeSession(conn.session)
+		return nil, ErrClosed
+	}
 	t.conn = conn
 	t.mu.Unlock()
 	targetType := t.Target().Type
@@ -83,6 +106,8 @@ func (t *Tab) Connection(ctx context.Context) (*Connection, error) {
 	}
 	return conn, nil
 }
+
+// Send executes a CDP command in this target's session; see Connection.Send.
 func (t *Tab) Send(ctx context.Context, method string, params, out any) error {
 	c, err := t.Connection(ctx)
 	if err != nil {
@@ -90,11 +115,16 @@ func (t *Tab) Send(ctx context.Context, method string, params, out any) error {
 	}
 	return c.Send(ctx, method, params, out)
 }
+
+// Call executes a target CDP command and returns its raw JSON result.
 func (t *Tab) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	var result json.RawMessage
 	err := t.Send(ctx, method, params, &result)
 	return result, err
 }
+
+// On subscribes to target events, enabling supported domains. See Subscription
+// for callback ordering, unbounded queue behavior and cleanup requirements.
 func (t *Tab) On(ctx context.Context, method string, fn func(Event)) (*Subscription, error) {
 	c, err := t.Connection(ctx)
 	if err != nil {
@@ -102,6 +132,8 @@ func (t *Tab) On(ctx context.Context, method string, fn func(Event)) (*Subscript
 	}
 	return c.On(ctx, method, fn)
 }
+
+// Enable enables a CDP domain in this target's session.
 func (t *Tab) Enable(ctx context.Context, domain string) error {
 	c, err := t.Connection(ctx)
 	if err != nil {
@@ -109,6 +141,8 @@ func (t *Tab) Enable(ctx context.Context, domain string) error {
 	}
 	return c.Enable(ctx, domain)
 }
+
+// DisableDOMAgent disables DOM notifications in this target's session.
 func (t *Tab) DisableDOMAgent(ctx context.Context) error {
 	c, err := t.Connection(ctx)
 	if err != nil {
@@ -116,6 +150,8 @@ func (t *Tab) DisableDOMAgent(ctx context.Context) error {
 	}
 	return c.Disable(ctx, "DOM")
 }
+
+// Wait waits for an idle interval in target CDP events (default 250 milliseconds).
 func (t *Tab) Wait(ctx context.Context, idle ...time.Duration) error {
 	c, err := t.Connection(ctx)
 	if err != nil {
@@ -127,7 +163,11 @@ func (t *Tab) Wait(ctx context.Context, idle ...time.Duration) error {
 	}
 	return c.Wait(ctx, d)
 }
+
+// Sleep waits for d or context cancellation.
 func (t *Tab) Sleep(ctx context.Context, d time.Duration) error { return Sleep(ctx, d) }
+
+// UpdateTarget refreshes this target's URL, title and other metadata from CDP.
 func (t *Tab) UpdateTarget(ctx context.Context) error {
 	r, err := cdp.Target.GetTargetInfo(cdp.TargetGetTargetInfoParams{TargetID: cdp.Ptr(cdp.TargetTargetID(t.TargetID()))}).Execute(ctx, t.browser)
 	if err == nil {
@@ -138,6 +178,8 @@ func (t *Tab) UpdateTarget(ctx context.Context) error {
 	return err
 }
 
+// Navigate loads address and waits for DOMContentLoaded or load in the new document.
+// Use a context deadline to bound the entire navigation, including event waits.
 func (t *Tab) Navigate(ctx context.Context, address string) error {
 	if err := t.Enable(ctx, "Page"); err != nil {
 		return err
@@ -191,12 +233,16 @@ func (t *Tab) Navigate(ctx context.Context, address string) error {
 	}
 	return t.WaitForReadyState(ctx, "interactive")
 }
+
+// Get navigates this tab, or creates a new tab/window when requested by options.
 func (t *Tab) Get(ctx context.Context, address string, options ...NavigationOptions) (*Tab, error) {
 	if len(options) > 0 && (options[0].NewTab || options[0].NewWindow) {
 		return t.browser.NewTab(ctx, address, options[0].NewWindow)
 	}
 	return t, t.Navigate(ctx, address)
 }
+
+// Reload reloads the page and waits for completion; ignoreCache defaults to true.
 func (t *Tab) Reload(ctx context.Context, ignoreCache ...bool) error {
 	ignore := true
 	if len(ignoreCache) > 0 {
@@ -269,13 +315,21 @@ func (t *Tab) waitForNavigationCommand(ctx context.Context, state string, comman
 	}
 	return t.UpdateTarget(ctx)
 }
-func (t *Tab) Back(ctx context.Context) error    { return t.history(ctx, -1) }
+
+// Back navigates to the previous history entry.
+func (t *Tab) Back(ctx context.Context) error { return t.history(ctx, -1) }
+
+// Forward navigates to the next history entry.
 func (t *Tab) Forward(ctx context.Context) error { return t.history(ctx, 1) }
+
+// Close closes the target with an independent five-second context.
 func (t *Tab) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return t.CloseContext(ctx)
 }
+
+// CloseContext closes the target and removes its local target/session state.
 func (t *Tab) CloseContext(ctx context.Context) error {
 	r, err := cdp.Target.CloseTarget(cdp.TargetCloseTargetParams{TargetID: cdp.TargetTargetID(t.TargetID())}).Execute(ctx, t.browser)
 	if err != nil {
@@ -284,28 +338,26 @@ func (t *Tab) CloseContext(ctx context.Context) error {
 	if !r.Success {
 		return fmt.Errorf("dgodriver: target could not close")
 	}
-	t.mu.Lock()
-	t.destroyed = true
-	c := t.conn
-	t.mu.Unlock()
-	if c != nil {
-		c.finish()
-	}
-	t.browser.mu.Lock()
-	delete(t.browser.targets, t.TargetID())
-	t.browser.mu.Unlock()
+	t.browser.removeTarget(t.TargetID())
 	return nil
 }
+
+// Activate activates this target using the browser's target API.
 func (t *Tab) Activate(ctx context.Context) error {
 	_, err := cdp.Target.ActivateTarget(cdp.TargetActivateTargetParams{TargetID: cdp.TargetTargetID(t.TargetID())}).Execute(ctx, t.browser)
 	return err
 }
+
+// BringToFront brings the page to the foreground.
 func (t *Tab) BringToFront(ctx context.Context) error {
 	_, err := cdp.Page.BringToFront().Execute(ctx, t)
 	return err
 }
 
-type JavaScriptError struct{ Details cdp.RuntimeExceptionDetails }
+// JavaScriptError contains the exception raised by page JavaScript.
+type JavaScriptError struct {
+	Details cdp.RuntimeExceptionDetails
+}
 
 func (e *JavaScriptError) Error() string {
 	if e.Details.Exception != nil && e.Details.Exception.Description != nil {
@@ -314,12 +366,17 @@ func (e *JavaScriptError) Error() string {
 	return "dgodriver: JavaScript: " + e.Details.Text
 }
 
+// EvaluateOptions controls promise waiting and the result returned by Evaluate or Apply.
 type EvaluateOptions struct {
 	AwaitPromise bool
+	// RemoteObject returns CDP metadata into out instead of the JSON value.
 	RemoteObject bool
 	ContextID    *cdp.RuntimeExecutionContextID
 }
 
+// Evaluate runs JavaScript in the target and decodes the JSON result into out.
+// out may be nil to discard the result. AwaitPromise must be set to await promises;
+// RemoteObject expects out to receive a cdp.RuntimeRemoteObject.
 func (t *Tab) Evaluate(ctx context.Context, expression string, out any, options ...EvaluateOptions) error {
 	var opt EvaluateOptions
 	if len(options) > 0 {
@@ -350,6 +407,8 @@ func decodeEvaluation(object cdp.RuntimeRemoteObject, exception *cdp.RuntimeExce
 	}
 	return json.Unmarshal(raw, out)
 }
+
+// JSDumps serializes an expression, stringifying big integers and marking cycles.
 func (t *Tab) JSDumps(ctx context.Context, expression string) (json.RawMessage, error) {
 	var out json.RawMessage
 	err := t.Evaluate(ctx, "(()=>{const seen=new WeakSet();return JSON.parse(JSON.stringify(("+expression+"),(_,value)=>{if(typeof value==='bigint')return value.toString();if(value&&typeof value==='object'){if(seen.has(value))return '[Circular]';seen.add(value)}return value}))})()", &out)
@@ -386,6 +445,9 @@ func defaultTimeout(ctx context.Context, options []QueryOptions) (context.Contex
 	limited, cancel := context.WithTimeout(ctx, opt.Timeout)
 	return limited, cancel, opt
 }
+
+// WaitForReadyState waits for loading, interactive or complete. Complete also
+// satisfies interactive. Use a context deadline to bound polling.
 func (t *Tab) WaitForReadyState(ctx context.Context, state string) error {
 	if state != "loading" && state != "interactive" && state != "complete" {
 		return fmt.Errorf("dgodriver: invalid ready state %q", state)
@@ -403,16 +465,22 @@ func (t *Tab) WaitForReadyState(ctx context.Context, state string) error {
 		return current == state || (state == "interactive" && current == "complete"), nil
 	})
 }
+
+// GetContent returns the document element's outer HTML.
 func (t *Tab) GetContent(ctx context.Context) (string, error) {
 	var html string
 	err := t.Evaluate(ctx, "document.documentElement.outerHTML", &html)
 	return html, err
 }
+
+// GetLocalStorage reads localStorage for the current page's origin.
 func (t *Tab) GetLocalStorage(ctx context.Context) (map[string]string, error) {
 	var result map[string]string
 	err := t.Evaluate(ctx, "(()=>{const out={};for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);Object.defineProperty(out,k,{value:localStorage.getItem(k),enumerable:true,configurable:true})}return out})()", &result)
 	return result, err
 }
+
+// SetLocalStorage writes items into localStorage for the current page's origin.
 func (t *Tab) SetLocalStorage(ctx context.Context, items map[string]string) error {
 	raw, err := json.Marshal(items)
 	if err != nil {
@@ -420,6 +488,8 @@ func (t *Tab) SetLocalStorage(ctx context.Context, items map[string]string) erro
 	}
 	return t.Evaluate(ctx, "Object.entries("+string(raw)+").forEach(([k,v])=>localStorage.setItem(k,v))", nil)
 }
+
+// SetUserAgent overrides the target's user agent, optionally Accept-Language and platform.
 func (t *Tab) SetUserAgent(ctx context.Context, userAgent string, languagePlatform ...string) error {
 	p := cdp.NetworkSetUserAgentOverrideParams{UserAgent: userAgent}
 	if len(languagePlatform) > 0 {
@@ -432,6 +502,9 @@ func (t *Tab) SetUserAgent(ctx context.Context, userAgent string, languagePlatfo
 	return err
 }
 
+// QueryOptions controls element searches. Polling searches default to ten seconds;
+// a negative Timeout uses only the caller's context. Immediate QuerySelector APIs
+// do not poll. IncludeFrames also searches shadow roots and descendant frames.
 type QueryOptions struct {
 	Timeout       time.Duration
 	IncludeFrames bool
@@ -466,6 +539,8 @@ func (t *Tab) describe(ctx context.Context, id cdp.DOMNodeID) (*Element, error) 
 	}
 	return &Element{tab: t, node: r.Node}, nil
 }
+
+// QuerySelectorAll returns current CSS matches without waiting for elements to appear.
 func (t *Tab) QuerySelectorAll(ctx context.Context, selector string, options ...QueryOptions) ([]*Element, error) {
 	root, err := t.document(ctx)
 	if err != nil {
@@ -517,6 +592,8 @@ func (t *Tab) QuerySelectorAll(ctx context.Context, selector string, options ...
 	}
 	return elements, nil
 }
+
+// QuerySelector returns the first current CSS match or ErrNotFound without polling.
 func (t *Tab) QuerySelector(ctx context.Context, selector string, options ...QueryOptions) (*Element, error) {
 	list, err := t.QuerySelectorAll(ctx, selector, options...)
 	if err != nil {
@@ -527,6 +604,8 @@ func (t *Tab) QuerySelector(ctx context.Context, selector string, options ...Que
 	}
 	return list[0], nil
 }
+
+// SelectAll polls until at least one element matches the CSS selector.
 func (t *Tab) SelectAll(ctx context.Context, selector string, options ...QueryOptions) (result []*Element, err error) {
 	limited, cancel, opt := defaultTimeout(ctx, options)
 	defer cancel()
@@ -537,6 +616,8 @@ func (t *Tab) SelectAll(ctx context.Context, selector string, options ...QueryOp
 	})
 	return
 }
+
+// Select polls for the first CSS match; see QueryOptions for timeout behavior.
 func (t *Tab) Select(ctx context.Context, selector string, options ...QueryOptions) (*Element, error) {
 	items, err := t.SelectAll(ctx, selector, options...)
 	if err != nil {
@@ -646,6 +727,8 @@ func (t *Tab) FindElementsByText(ctx context.Context, text string, options ...Qu
 	}
 	return result, nil
 }
+
+// FindAll polls until at least one element matches text.
 func (t *Tab) FindAll(ctx context.Context, text string, options ...QueryOptions) (result []*Element, err error) {
 	limited, cancel, opt := defaultTimeout(ctx, options)
 	defer cancel()
@@ -656,6 +739,8 @@ func (t *Tab) FindAll(ctx context.Context, text string, options ...QueryOptions)
 	})
 	return
 }
+
+// Find polls for text and returns the element with the closest text length.
 func (t *Tab) Find(ctx context.Context, text string, options ...QueryOptions) (*Element, error) {
 	items, err := t.FindAll(ctx, text, options...)
 	if err != nil {
@@ -663,6 +748,8 @@ func (t *Tab) Find(ctx context.Context, text string, options ...QueryOptions) (*
 	}
 	return bestTextMatch(ctx, items, text)
 }
+
+// WaitFor polls for selector, or text when selector is empty.
 func (t *Tab) WaitFor(ctx context.Context, selector, text string, options ...QueryOptions) (*Element, error) {
 	if selector != "" {
 		return t.Select(ctx, selector, options...)
@@ -672,6 +759,8 @@ func (t *Tab) WaitFor(ctx context.Context, selector, text string, options ...Que
 	}
 	return nil, fmt.Errorf("dgodriver: WaitFor needs a selector or text")
 }
+
+// GetFrames returns out-of-process iframe targets belonging to this page's frame tree.
 func (t *Tab) GetFrames(ctx context.Context) ([]*Tab, error) {
 	if err := t.browser.UpdateTargets(ctx); err != nil {
 		return nil, err

@@ -13,12 +13,16 @@ import (
 	"github.com/aijiesd520/dgodriver/cdp"
 )
 
+// CookieJar manages browser cookies in the default or an isolated browser context.
 type CookieJar struct {
 	browser   *Browser
 	contextID string
 }
 
+// Cookies returns a manager for the default browser context's cookies.
 func (b *Browser) Cookies() *CookieJar { return &CookieJar{browser: b} }
+
+// GetAll returns cookies from this jar's browser context.
 func (j *CookieJar) GetAll(ctx context.Context) ([]cdp.NetworkCookie, error) {
 	p := cdp.StorageGetCookiesParams{}
 	if j.contextID != "" {
@@ -27,6 +31,8 @@ func (j *CookieJar) GetAll(ctx context.Context) ([]cdp.NetworkCookie, error) {
 	r, err := cdp.Storage.GetCookies(p).Execute(ctx, j.browser)
 	return r.Cookies, err
 }
+
+// SetAll sets cookies in this jar's browser context.
 func (j *CookieJar) SetAll(ctx context.Context, cookies []cdp.NetworkCookieParam) error {
 	p := cdp.StorageSetCookiesParams{Cookies: cookies}
 	if j.contextID != "" {
@@ -35,6 +41,8 @@ func (j *CookieJar) SetAll(ctx context.Context, cookies []cdp.NetworkCookieParam
 	_, err := cdp.Storage.SetCookies(p).Execute(ctx, j.browser)
 	return err
 }
+
+// Clear removes all cookies from this jar's browser context.
 func (j *CookieJar) Clear(ctx context.Context) error {
 	p := cdp.StorageClearCookiesParams{}
 	if j.contextID != "" {
@@ -43,6 +51,8 @@ func (j *CookieJar) Clear(ctx context.Context) error {
 	_, err := cdp.Storage.ClearCookies(p).Execute(ctx, j.browser)
 	return err
 }
+
+// HTTPCookies converts stored browser cookies into net/http cookies.
 func (j *CookieJar) HTTPCookies(ctx context.Context) ([]*http.Cookie, error) {
 	list, err := j.GetAll(ctx)
 	if err != nil {
@@ -82,6 +92,9 @@ func cookiePattern(pattern []string) (*regexp.Regexp, error) {
 	}
 	return regexp.Compile(s)
 }
+
+// Save writes cookies as JSON using file mode 0600, optionally filtering
+// the cookie name and domain using a regular expression.
 func (j *CookieJar) Save(ctx context.Context, path string, pattern ...string) error {
 	re, err := cookiePattern(pattern)
 	if err != nil {
@@ -103,6 +116,8 @@ func (j *CookieJar) Save(ctx context.Context, path string, pattern ...string) er
 	}
 	return writeAtomic(path, raw, 0600)
 }
+
+// Load imports a saved cookie JSON file, optionally filtering names and domains by regexp.
 func (j *CookieJar) Load(ctx context.Context, path string, pattern ...string) error {
 	re, err := cookiePattern(pattern)
 	if err != nil {
